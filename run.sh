@@ -1,0 +1,1 @@
+python3 main.py --world_size 8
