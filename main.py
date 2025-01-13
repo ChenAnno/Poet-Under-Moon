@@ -1,238 +1,131 @@
-import argparse
 import os
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
-import torch.optim as optim
-from torch import Tensor
+import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler, random_split
-from rich.progress import Progress
-from dataset import PoetryData
-from model import PoetryNet
-import time
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from dataset import PoemDataset
+from model import TransformerPoem
+import argparse
+from tqdm import tqdm  # 导入 tqdm
+import random
+import numpy as np
 
-batch_size = 64
-lr = 0.0001
 
-class PoetryGen:
-    def __init__(self, rank, world_size, args) -> None:
-        self.rank = rank
-        self.world_size = world_size
-        self.device = torch.device(f"cuda:{rank}")
-        self.dataset = PoetryData(self.device, max_lines=50000, token_length=12)
-        self.vocab_size = self.dataset.vocab_size
-        train_data, test_data = random_split(self.dataset, [len(self.dataset) - 1000, 1000])
-        train_sampler = DistributedSampler(train_data, num_replicas=world_size, rank=rank)
-        test_sampler = DistributedSampler(test_data, num_replicas=world_size, rank=rank)
-        self.train_dataloader = DataLoader(train_data, batch_size, sampler=train_sampler)
-        self.test_dataloader = DataLoader(test_data, batch_size, sampler=test_sampler)
+def set_seed(seed):
+    """固定随机数种子"""
+    random.seed(seed)          # Python 随机数种子
+    np.random.seed(seed)       # NumPy 随机数种子
+    torch.manual_seed(seed)    # PyTorch 随机数种子
+    torch.cuda.manual_seed(seed)  # CUDA 随机数种子
+    torch.cuda.manual_seed_all(seed)  # 如果使用多卡，设置所有 GPU 的随机数种子
+    torch.backends.cudnn.deterministic = True  # 确保 CUDA 卷积操作的结果确定
+    torch.backends.cudnn.benchmark = False     # 关闭 CUDA 卷积优化，以确保结果可复现
 
-        self.net = PoetryNet(self.vocab_size, self.device, embed_size=512).to(self.device)
-        self.net = DDP(self.net, device_ids=[rank])
-        self.optimizer = optim.Adam(self.net.parameters(), lr)
-        self.optimizer_scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, 256)
-
-        self.loss_f = torch.nn.CrossEntropyLoss(ignore_index=2)
-        self.loaded_checkpoint_file = None
-        self.epoch = 0
-
-        self.progress = Progress()
-
-        import glob
-
-        files = glob.glob("checkpoint-*.pth")
-        for i, file in enumerate(files):
-            print(f"{i}> {file}")
-        if files:
-            t = input("choose check point to load, default is the last one, n to unload>")
-            if t == "":
-                t = -1
-            if t != "n":
-                self.load_checkpoint(files[int(t)])
-
-    def save_checkpoint(self):
-        file_name = (
-            self.loaded_checkpoint_file
-            or f'checkpoint-{time.strftime("%y%m%d-%H%M")}.pth'
-        )
-        if self.rank == 0:
-            with open(file_name, "wb") as file:
-                torch.save(
-                    {
-                        "net_state": self.net.module.state_dict(),
-                        "optimizer_state": self.optimizer.state_dict(),
-                        "epoch": self.epoch,
-                    },
-                    file,
-                )
-            print(f"save check point to {file_name}")
-            self.loaded_checkpoint_file = file_name
-
-    def load_checkpoint(self, file: str):
-        ckpt = torch.load(file, map_location=self.device)
-        self.net.load_state_dict(ckpt["net_state"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state"])
-        self.epoch = ckpt["epoch"]
-
-        self.loaded_checkpoint_file = file
-        self.optimizer_scheduler.last_epoch = self.epoch
-        print(f"loaded check point: {file}, epoch: {self.epoch}")
-
-    def generate_one(self, pre_sentence: str, start_words: str = ""):
-        self.net.eval()
-        start_words_token = [0]
-        start_words_token.extend(self.dataset.word2idx[x] for x in start_words)
-        src = self.dataset.word2token(pre_sentence).unsqueeze(0)
-        tgt = torch.LongTensor([start_words_token]).to(self.device)
-        memo = self.net.module.encode(src)
-        res = []
-        for i in range(12):
-            out = self.net.module.decode(tgt, memo)
-            next_word = out.argmax(2)
-            if next_word[0][-1] == 1:
-                break
-            res.append(next_word[0][-1].item())
-            tgt = torch.cat((tgt, next_word[:, -1:]), 1)
-
-        return start_words + self.dataset.token2word(res)
-
-    def generate(self, num_sentence: int, pre_style: str):
-        res = []
-        for i in range(num_sentence):
-            s = self.generate_one(pre_style if not res else res[-1])
-            res.append(s)
-        return "/".join(res)
-
-    def generate_by_start(self, start_words: str, pre_style: str) -> str:
-        res = []
-        start_words_l = start_words.split("/")
-        if not start_words_l:
-            return ""
-        for i, s in enumerate(start_words_l):
-            t = self.generate_one(pre_style if not res else res[-1], s)
-            res.append(t)
-        return "/".join(res)
-
-    def forward_net(self, src: Tensor, tgt: Tensor):
-        src, tgt = src.to(self.device), tgt.to(self.device)
-        src_mask = (src == 2).to(self.device)
-
-        dec_tgt = tgt[:, :-1]
-        dec_tgt_mask = (dec_tgt == 2).to(self.device)
-        tgt_mask = torch.nn.Transformer.generate_square_subsequent_mask(dec_tgt.size(1), self.device)
-
-        out = self.net(src, dec_tgt, tgt_mask, src_mask, dec_tgt_mask)
-        return out
-
-    def train_epoch(self):
-        self.net.train()
-        train_progress = self.progress.add_task(description="Train Epoch", total=len(self.train_dataloader))
-        loss_f = self.loss_f
-
-        vocab_size = self.dataset.vocab_size
-        len_data = len(self.train_dataloader)
-        loss_all = 0
-        for i, (src, tgt) in enumerate(self.train_dataloader):
-            out = self.forward_net(src, tgt)
-            loss = loss_f(out.reshape(-1, vocab_size), tgt[:, 1:].flatten())
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-
-            self.progress.update(
-                train_progress,
-                advance=1,
-                description=f"{i}/{len_data} loss={loss.item():.4f}",
-            )
-            loss_all += loss.item()
-        self.optimizer_scheduler.step()
-        self.progress.remove_task(train_progress)
-        self.progress.print(
-            f"train epoch={self.epoch} average loss={loss_all/len_data:.4f} lr={self.optimizer_scheduler.get_lr()}"
-        )
-
-    def evaluation(self):
-        self.net.eval()
-
-        loss_f = self.loss_f
-        vocab_size = self.dataset.vocab_size
-
-        loss_a = 0
-        with torch.no_grad():
-            for i, (src, tgt) in enumerate(self.test_dataloader):
-                out = self.forward_net(src, tgt)
-                loss = loss_f(out.reshape(-1, vocab_size), tgt[:, 1:].flatten())
-                loss_a += loss.item()
-
-        self.progress.print(
-            f"Validation: epoch={self.epoch} avg loss={loss_a/len(self.test_dataloader):.4f}"
-        )
-
-    def training(self, train_epoch_nums: int = 36):
-        self.progress.start()
-        training_all = self.progress.add_task(
-            description=f"epoch={self.epoch} lr={self.optimizer_scheduler.get_lr()}",
-            total=train_epoch_nums,
-        )
-        for i in range(train_epoch_nums):
-            self.progress.update(
-                training_all,
-                advance=1,
-                description=f"epoch={self.epoch} lr={self.optimizer_scheduler.get_lr()}",
-            )
-            self.train_epoch()
-            self.evaluation()
-            self.epoch += 1
-            self.save_checkpoint()
-            print(self.generate(4, "床前明月光"))
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Transformer Model Training with DDP")
-    
-    parser.add_argument('--file_path', type=str, default='archive/chinese_poems.txt', help='Path to the training data')
-    parser.add_argument('--seq_length', type=int, default=50, help='Sequence length for training')
-    parser.add_argument('--batch_size', type=int, default=512, help='Batch size for training')
-    parser.add_argument('--d_model', type=int, default=512, help='Dimension of model')
-    parser.add_argument('--nhead', type=int, default=8, help='Number of heads in the multiheadattention models')
-    parser.add_argument('--num_encoder_layers', type=int, default=6, help='Number of encoder layers')
-    parser.add_argument('--num_decoder_layers', type=int, default=6, help='Number of decoder layers')
-    parser.add_argument('--dim_feedforward', type=int, default=2048, help='Dimension of the feedforward network model')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout value')
-    parser.add_argument('--activation', type=str, default='relu', choices=['relu', 'gelu', 'glu'], help='Activation function to use')
-    parser.add_argument('--use_relative_positions', action='store_true', help='Use relative position encoding')
-    parser.add_argument('--use_sparse_attention', action='store_true', help='Use sparse attention mechanism')
-    parser.add_argument('--epochs', type=int, default=36, help='Number of epochs to train')
-    parser.add_argument('--save_model', type=str, default='transformer_model.pth', help='Path to save the trained model')
-    parser.add_argument('--world_size', type=int, default=8, help='Number of GPUs to use')
-    parser.add_argument('--init_lr', type=float, default=0.008, help='Initial learning rate')
-    parser.add_argument('--val_split', type=float, default=0.2, help='Validation data split ratio')
-
-    return parser.parse_args()
 
 def setup(rank, world_size):
+    """初始化进程组"""
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+    os.environ['MASTER_PORT'] = '50001'  # 使用一个较大的端口号
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.manual_seed(42)
-    torch.cuda.set_device(rank)
 
 def cleanup():
+    """清理进程组"""
     dist.destroy_process_group()
 
-def main_worker(rank, world_size, args):
+def train(rank, world_size, args):
+    """训练函数"""
     setup(rank, world_size)
 
-    model = PoetryGen(rank, world_size, args)
-    model.training(args.epochs)
+    set_seed(args.seed)
+
+    # TODO 加载数据
+    dataset = PoemDataset('archive/5yan.txt')
+    # dataset = PoemDataset('archive/chinese_poems.txt')
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler)
+
+    # 初始化模型
+    model = TransformerPoem(vocab_size=len(dataset.word2idx)).to(rank)
+    model = DDP(model, device_ids=[rank])
+
+    # 训练逻辑
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    criterion = nn.CrossEntropyLoss(ignore_index=dataset.word2idx['<pad>'])
+
+    for epoch in range(args.epochs):
+        sampler.set_epoch(epoch)
+        model.train()
+
+        # 使用 tqdm 显示训练进度条
+        dataloader_len = len(dataloader)
+        if rank == 0 and args.tqdm:  # 只在主进程显示进度条
+            dataloader = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False, total=dataloader_len)
+
+        for batch in dataloader:
+            src = batch.to(rank)  # 完整的输入序列
+            tgt = batch.to(rank)  # 完整的目标序列
+            # print("Here:", src.shape, tgt.shape)
+            # 这里太容易写错了，务必仔细检查
+            output = model(src[:, :-1], tgt[:, :-1])
+
+            # 计算损失（解码器的输出需要与 tgt 的后 n-1 个 token 进行比较）
+            loss = criterion(output.view(-1, output.size(-1)), tgt[:, 1:].reshape(-1))
+
+            # 反向传播和优化
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if rank == 0 and args.tqdm:  # 只在主进程打印日志
+                dataloader.set_postfix(loss=loss.item())
+
+        # 每个epoch结束后生成诗歌（只在主进程生成）
+        if rank == 0:
+            start_text = "窗前明月光"
+            generated_poem = generate(model.module, start_text, dataset)
+            print(f"\nEpoch {epoch + 1}, 生成诗歌: {generated_poem}")
 
     cleanup()
 
-def main():
-    args = parse_args()
-    world_size = args.world_size
-    mp.spawn(main_worker, args=(world_size, args), nprocs=world_size, join=True)
+def generate(model, start_text, dataset, max_len=50, temperature=1.0):
+    """自回归生成诗歌"""
+    model.eval()
+    tokens = list(start_text)
+    tokens = ['<bos>'] + tokens
+    input_ids = [dataset.word2idx.get(token, dataset.word2idx['<unk>']) for token in tokens]
+    input_ids = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0).cuda()
+    generated_ids = input_ids
+    for _ in range(max_len):
+        with torch.no_grad():
+            output = model(generated_ids, generated_ids)
+            logits = output[:, -1, :] / temperature
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            generated_ids = torch.cat([generated_ids, next_token], dim=-1)
 
-if __name__ == "__main__":
-    main()
+            if next_token.item() == dataset.word2idx['<eos>']:
+                break
+
+    generated_tokens = [dataset.idx2word[idx.item()] for idx in generated_ids[0]]
+    return ''.join(generated_tokens[1:-1])  # 去掉<bos>和<eos>
+
+if __name__ == '__main__':
+    # 解析参数
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--world_size', type=int, default=8, help='Number of GPUs')
+    parser.add_argument('--epochs', type=int, default=5000, help='Number of epochs')
+    parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--tqdm', type=bool, default=False, help='Whether use tqdm')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    args = parser.parse_args()
+
+    # 启动多进程训练
+    torch.multiprocessing.spawn(
+        train,
+        args=(args.world_size, args),
+        nprocs=args.world_size,
+        join=True
+    )
