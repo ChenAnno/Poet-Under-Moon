@@ -63,10 +63,16 @@ bash run.sh
 
 训练脚本 `run.sh` 的主要参数如下：
 
-- `--train_data_path`：数据集路径（默认：`./archive/chinese_poems.txt`）。
+- `--train_data_path`：数据集路径（默认：`./archive/5yan.txt`）。
 - `--batch_size`：批量大小（默认：512）。
 - `--epochs`：训练轮数（默认：100）。
 - `--lr`：学习率（默认：5e-4）。
+- `--use_glu`：使用GLU（默认：`False`）。
+- `--use_relative_pos`：使用相对位置编码（默认：`False`）。
+- `--use_sparse_attn`：使用稀疏注意力（默认：`False`）。
+- `--residual_before_ln`：残差前置（默认：`True`）。
+- `--num_layers`：Transformer层数（默认：12）。
+- `--use_custom`：完全自行搭建模型（默认：`False`）。
 
 训练过程中，模型检查点会保存到 `ckpt/` 文件夹，损失曲线会保存到 `figures/`文件夹。
 
