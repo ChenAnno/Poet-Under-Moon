@@ -94,7 +94,13 @@ python test.py
 
 请输入五言诗的前句：床前明月光
 ```
-
+提供ckpt的下载链接如下
+```
+https://disk.pku.edu.cn/link/AA4C3B7DF08E2F48B7ADEB6023D01641D6
+文件名：base_final.pt
+有效期限：2025-03-15 07:09
+提取码：xn2A
+```
 ---
 
 ## 代码说明
