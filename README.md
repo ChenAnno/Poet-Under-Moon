@@ -99,22 +99,22 @@ python test.py
 
 ## 代码说明
 
-### 1. `dataset.py`
+#### 1. `dataset.py`
 
 - **`PoemDataset` 类**：负责加载古诗数据集，并进行分词、添加特殊标记。
 - **词汇表**：自动构建词汇表（`word2idx` 和 `idx2word`）。
 
-### 2. `model.py`
+#### 2. `model.py`
 
 - **`TransformerPoem` 类**：基于 PyTorch 实现 Transformer 模型，支持自定义残差连接位置、GLU 激活函数、相对位置编码等。
 - **`TransformerPoemCustom` 类**：使用 PyTorch 基础模块逐步搭建 Transformer 模型。
 
-### 3. `main.py`
+#### 3. `main.py`
 
 - **训练逻辑**：实现数据加载、模型训练、损失记录、模型保存等功能。
 - **多卡训练**：支持使用 `torchrun` 进行分布式训练。
 
-### 4. `test.py`
+#### 4. `test.py`
 
 - **交互式生成**：加载训练好的模型，允许用户输入五言诗前句，生成完整古诗。
 
@@ -126,7 +126,7 @@ python test.py
 
 训练过程中，损失曲线会保存到 `figures/`，示例如下：
 
-![Loss Curve](./figures/base_loss_curve.pdf)
+![Loss Curve](./figures/loss.png)
 
 ### 2. 测试案例
 
