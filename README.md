@@ -170,12 +170,6 @@ python test.py
 
 ---
 
-## 许可证
-
-本项目基于 MIT 许可证开源。
-
----
-
 ## 致谢
 
 - 感谢 [PyTorch](https://pytorch.org/) 提供的深度学习框架。
