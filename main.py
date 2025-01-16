@@ -136,7 +136,7 @@ def train(rank, world_size, args):
         plt.ylabel("Loss")
         plt.title("Training Loss Curve")
         plt.legend()
-        plt.savefig(f"ckpt/{args.exp_name}_loss_curve.pdf")  # 保存损失曲线图
+        plt.savefig(f"figures/{args.exp_name}_loss_curve.pdf")  # 保存损失曲线图
         print("损失曲线已保存为 loss_curve.pdf")
 
         # 简单测试
